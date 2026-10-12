@@ -1,0 +1,13 @@
+# Local / testnet setup: Postgres + the backend. For production use a managed Postgres with backups.
+services:
+  db:
+    image: postgres:16
+    environment: { POSTGRES_USER: casino, POSTGRES_PASSWORD: casino, POSTGRES_DB: casino }
+    volumes: [ "pgdata:/var/lib/postgresql/data" ]
+  api:
+    build: .
+    env_file: .env
+    environment: { DATABASE_URL: "postgres://casino:casino@db:5432/casino" }
+    ports: [ "127.0.0.1:8787:8787" ]   # only reachable through your reverse proxy (set TRUST_PROXY=1 for one proxy)
+    depends_on: [ db ]
+volumes: { pgdata: {} }

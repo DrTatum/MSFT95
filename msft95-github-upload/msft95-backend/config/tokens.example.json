@@ -1,0 +1,52 @@
+[
+  {
+    "symbol": "ETH",
+    "address": "0x0000000000000000000000000000000000000000",
+    "decimals": 18,
+    "minBet": "10000000000000",
+    "maxBet": "10000000000000000",
+    "maxPayout": "100000000000000000000",
+    "minWithdrawal": "100000000000000",
+    "userDailyWithdrawal": "50000000000000000000"
+  },
+  {
+    "symbol": "MSFT95",
+    "address": "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512",
+    "decimals": 18,
+    "minBet": "1000000000000000000",
+    "maxBet": "1000000000000000000000",
+    "maxPayout": "10000000000000000000000000",
+    "minWithdrawal": "1000000000000000000",
+    "userDailyWithdrawal": "10000000000000000000000000"
+  },
+  {
+    "symbol": "USDC",
+    "address": "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+    "decimals": 6,
+    "minBet": "100000",
+    "maxBet": "100000000",
+    "maxPayout": "1000000000000",
+    "minWithdrawal": "1000000",
+    "userDailyWithdrawal": "1000000000000"
+  },
+  {
+    "symbol": "NET",
+    "address": "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853",
+    "decimals": 18,
+    "minBet": "1000000000000000",
+    "maxBet": "1000000000000000000",
+    "maxPayout": "10000000000000000000000",
+    "minWithdrawal": "10000000000000000",
+    "userDailyWithdrawal": "10000000000000000000000"
+  },
+  {
+    "symbol": "IMD",
+    "address": "0x610178dA211FEF7D417bC0e6FeD39F05609AD788",
+    "decimals": 18,
+    "minBet": "10000000000000000",
+    "maxBet": "10000000000000000000",
+    "maxPayout": "100000000000000000000000",
+    "minWithdrawal": "100000000000000000",
+    "userDailyWithdrawal": "100000000000000000000000"
+  }
+]
