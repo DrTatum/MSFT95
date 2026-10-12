@@ -1,0 +1,327 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+
+import {AccessControlDefaultAdminRules} from "@openzeppelin/contracts/access/extensions/AccessControlDefaultAdminRules.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @title MSFT95 games vault
+ * @notice Custody contract for the MSFT95 casino (Stake-style: deposit on-chain, play off-chain, withdraw on-chain).
+ *
+ *  - Players deposit supported tokens (or native ETH). The vault only records the deposit in an event;
+ *    the backend ledger credits the player's balance after enough confirmations.
+ *  - Players withdraw with an EIP-712 voucher signed by the backend's SIGNER key. Large withdrawals
+ *    also need a second signature from a COSIGNER key held on separate infrastructure.
+ *  - Every voucher is single use (per-user nonce), expires, and is bound to this chain and this contract.
+ *  - Per-token limits cap the damage of a stolen signer key: a maximum per withdrawal and a daily
+ *    total. The day is a 24h window that starts with the first withdrawal after the previous window
+ *    ended, so in the worst case 2x dailyCap can leave inside any 24 hours (end of one window + start
+ *    of the next). Size dailyCap with that in mind.
+ *  - A GUARDIAN (e.g. the monitoring bot) can pause deposits and/or withdrawals instantly; only the
+ *    admin can unpause. The admin should be a Safe multisig behind a TimelockController on mainnet.
+ *
+ *  Trust model: like any custodial casino, players trust the operator to sign their withdrawals. The
+ *  contract limits how fast funds can leave if a key is compromised; it does not know player balances.
+ */
+contract MSFT95Vault is AccessControlDefaultAdminRules, ReentrancyGuard, EIP712 {
+    using SafeERC20 for IERC20;
+
+    // ---------------------------------------------------------------- roles
+    bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
+    bytes32 public constant SIGNER_ROLE = keccak256("SIGNER_ROLE");
+    bytes32 public constant COSIGNER_ROLE = keccak256("COSIGNER_ROLE");
+
+    /// @dev native ETH is represented by address(0)
+    address public constant ETH = address(0);
+
+    bytes32 public constant WITHDRAWAL_TYPEHASH =
+        keccak256("Withdrawal(address user,address token,uint256 amount,uint256 nonce,uint256 deadline)");
+
+    uint256 public constant WINDOW = 1 days;
+    uint256 public constant MAX_VOUCHER_LIFETIME = 1 days;
+
+    // ---------------------------------------------------------------- types
+    struct TokenConfig {
+        bool listed;          // withdrawals possible (never unlisted while players hold balances)
+        bool depositsEnabled; // new deposits accepted
+        uint128 minDeposit;   // smallest deposit accepted (token units)
+        uint128 maxWithdrawal; // largest single withdrawal
+        uint128 dailyCap;     // most that can leave per 24h window (players + house sweeps); see note above
+        uint128 cosignAbove;  // withdrawals above this need a COSIGNER signature too
+    }
+
+    struct Window {
+        uint64 start;
+        uint192 spent;
+    }
+
+    struct Withdrawal {
+        address user;
+        address token;
+        uint256 amount;
+        uint256 nonce;
+        uint256 deadline;
+    }
+
+    // ---------------------------------------------------------------- state
+    mapping(address => TokenConfig) public tokenConfig;
+    mapping(address => Window) public window;
+    mapping(address => mapping(uint256 => bool)) public nonceUsed;
+
+    bool public depositsPaused;
+    bool public withdrawalsPaused;
+
+    bool public allowlistOnly;
+    mapping(address => bool) public allowed;
+
+    uint256 public depositCount;
+
+    // ---------------------------------------------------------------- events
+    event Deposited(address indexed user, address indexed token, uint256 amount, uint256 indexed depositId);
+    event BankrollFunded(address indexed from, address indexed token, uint256 amount);
+    event Withdrawn(address indexed user, address indexed token, uint256 amount, uint256 indexed nonce, address relayer);
+    event HouseWithdrawal(address indexed token, address indexed to, uint256 amount);
+    event TokenConfigured(address indexed token, TokenConfig config);
+    event DepositsPaused(bool paused, address by);
+    event WithdrawalsPaused(bool paused, address by);
+    event AllowlistOnly(bool on);
+    event AllowedSet(address indexed user, bool allowed);
+
+    // ---------------------------------------------------------------- errors
+    error TokenNotListed(address token);
+    error DepositsClosed();
+    error WithdrawalsClosed();
+    error NotAllowed(address user);
+    error BelowMinDeposit(uint256 received, uint256 min);
+    error ZeroAmount();
+    error UseDepositETH();
+    error VoucherExpired();
+    error VoucherTooLong();
+    error NonceAlreadyUsed();
+    error AboveMaxWithdrawal(uint256 amount, uint256 max);
+    error DailyCapExceeded(uint256 wouldSpend, uint256 cap);
+    error BadSignatures();
+    error EthTransferFailed();
+    error BadConfig();
+
+    constructor(address admin, uint48 adminTransferDelay)
+        AccessControlDefaultAdminRules(adminTransferDelay, admin)
+        EIP712("MSFT95Vault", "1")
+    {}
+
+    // ================================================================ deposits
+
+    /// @notice Deposit an ERC-20. The amount credited is what the vault actually received
+    ///         (fee-on-transfer tokens are credited net of the fee).
+    function deposit(address token, uint256 amount) external nonReentrant returns (uint256 received) {
+        if (token == ETH) revert UseDepositETH();
+        _checkDeposit(token);
+        if (amount == 0) revert ZeroAmount();
+        uint256 before = IERC20(token).balanceOf(address(this));
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        received = IERC20(token).balanceOf(address(this)) - before;
+        _recordDeposit(token, received);
+    }
+
+    /// @notice Deposit native ETH.
+    function depositETH() external payable nonReentrant returns (uint256) {
+        _checkDeposit(ETH);
+        _recordDeposit(ETH, msg.value);
+        return msg.value;
+    }
+
+    /// @notice Add house bankroll. Not credited to anyone's player balance.
+    function fundBankroll(address token, uint256 amount) external payable nonReentrant {
+        if (!tokenConfig[token].listed) revert TokenNotListed(token);
+        uint256 received;
+        if (token == ETH) {
+            received = msg.value;
+        } else {
+            if (msg.value != 0) revert UseDepositETH();
+            uint256 before = IERC20(token).balanceOf(address(this));
+            IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+            received = IERC20(token).balanceOf(address(this)) - before;
+        }
+        if (received == 0) revert ZeroAmount();
+        emit BankrollFunded(msg.sender, token, received);
+    }
+
+    /// @dev plain ETH transfers are rejected so nobody loses funds by sending without depositETH()
+    receive() external payable {
+        revert UseDepositETH();
+    }
+
+    function _checkDeposit(address token) private view {
+        TokenConfig storage c = tokenConfig[token];
+        if (!c.listed) revert TokenNotListed(token);
+        if (depositsPaused || !c.depositsEnabled) revert DepositsClosed();
+        if (allowlistOnly && !allowed[msg.sender]) revert NotAllowed(msg.sender);
+    }
+
+    function _recordDeposit(address token, uint256 received) private {
+        if (received == 0) revert ZeroAmount();
+        uint256 min = tokenConfig[token].minDeposit;
+        if (received < min) revert BelowMinDeposit(received, min);
+        unchecked { ++depositCount; }
+        emit Deposited(msg.sender, token, received, depositCount);
+    }
+
+    // ================================================================ withdrawals
+
+    /// @notice Pay out a signed withdrawal voucher. Anyone may submit it (e.g. a gas relayer);
+    ///         the funds always go to `w.user`.
+    /// @param sigs one SIGNER signature, plus one COSIGNER signature when amount > cosignAbove
+    function withdraw(Withdrawal calldata w, bytes[] calldata sigs) external nonReentrant {
+        if (withdrawalsPaused) revert WithdrawalsClosed();
+        TokenConfig storage c = tokenConfig[w.token];
+        if (!c.listed) revert TokenNotListed(w.token);
+        if (w.amount == 0) revert ZeroAmount();
+        if (block.timestamp > w.deadline) revert VoucherExpired();
+        if (w.deadline > block.timestamp + MAX_VOUCHER_LIFETIME) revert VoucherTooLong();
+        if (nonceUsed[w.user][w.nonce]) revert NonceAlreadyUsed();
+        if (w.amount > c.maxWithdrawal) revert AboveMaxWithdrawal(w.amount, c.maxWithdrawal);
+
+        _verify(w, sigs, w.amount > c.cosignAbove);
+
+        nonceUsed[w.user][w.nonce] = true;
+        _spend(w.token, w.amount);
+        _pay(w.token, w.user, w.amount);
+        emit Withdrawn(w.user, w.token, w.amount, w.nonce, msg.sender);
+    }
+
+    function hashWithdrawal(Withdrawal calldata w) public view returns (bytes32) {
+        return _hashTypedDataV4(
+            keccak256(abi.encode(WITHDRAWAL_TYPEHASH, w.user, w.token, w.amount, w.nonce, w.deadline))
+        );
+    }
+
+    function _verify(Withdrawal calldata w, bytes[] calldata sigs, bool needCosigner) private view {
+        bytes32 digest = hashWithdrawal(w);
+        address signer;
+        address cosigner;
+        uint256 n = sigs.length;
+        if (n == 0 || n > 2) revert BadSignatures();
+        for (uint256 i; i < n; ++i) {
+            address a = ECDSA.recover(digest, sigs[i]);
+            if (signer == address(0) && hasRole(SIGNER_ROLE, a) && a != cosigner) {
+                signer = a;
+            } else if (cosigner == address(0) && hasRole(COSIGNER_ROLE, a) && a != signer) {
+                cosigner = a;
+            } else {
+                revert BadSignatures(); // unknown key, or the same key used twice
+            }
+        }
+        if (signer == address(0)) revert BadSignatures();
+        if (needCosigner && cosigner == address(0)) revert BadSignatures();
+    }
+
+    function _spend(address token, uint256 amount) private {
+        Window storage win = window[token];
+        if (block.timestamp >= uint256(win.start) + WINDOW) {
+            win.start = uint64(block.timestamp);
+            win.spent = 0;
+        }
+        uint256 spent = uint256(win.spent) + amount;
+        uint256 cap = tokenConfig[token].dailyCap;
+        if (spent > cap) revert DailyCapExceeded(spent, cap);
+        win.spent = uint192(spent);
+    }
+
+    function _pay(address token, address to, uint256 amount) private {
+        if (token == ETH) {
+            (bool ok, ) = to.call{value: amount}("");
+            if (!ok) revert EthTransferFailed();
+        } else {
+            IERC20(token).safeTransfer(to, amount);
+        }
+    }
+
+    // ================================================================ views
+
+    /// @notice How much more of `token` can leave before the current 24h window resets.
+    function remainingToday(address token) external view returns (uint256) {
+        Window memory win = window[token];
+        uint256 cap = tokenConfig[token].dailyCap;
+        if (block.timestamp >= uint256(win.start) + WINDOW) return cap;
+        return win.spent >= cap ? 0 : cap - win.spent;
+    }
+
+    function balanceOf(address token) external view returns (uint256) {
+        return token == ETH ? address(this).balance : IERC20(token).balanceOf(address(this));
+    }
+
+    function domainSeparator() external view returns (bytes32) {
+        return _domainSeparatorV4();
+    }
+
+    // ================================================================ admin
+
+    function setToken(address token, TokenConfig calldata cfg) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (cfg.depositsEnabled && !cfg.listed) revert BadConfig();
+        if (cfg.cosignAbove > cfg.maxWithdrawal || cfg.maxWithdrawal > cfg.dailyCap) revert BadConfig();
+        tokenConfig[token] = cfg;
+        emit TokenConfigured(token, cfg);
+    }
+
+    /// @notice House withdrawal (profits, bankroll moves). Counts against the same daily cap as players.
+    ///         On mainnet the admin is a timelocked multisig, so these are visible before they execute.
+    function sweep(address token, address to, uint256 amount) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        if (!tokenConfig[token].listed) revert TokenNotListed(token);
+        if (amount == 0 || to == address(0)) revert ZeroAmount();
+        _spend(token, amount);
+        _pay(token, to, amount);
+        emit HouseWithdrawal(token, to, amount);
+    }
+
+    function setAllowlistOnly(bool on) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        allowlistOnly = on;
+        emit AllowlistOnly(on);
+    }
+
+    function setAllowed(address[] calldata users, bool ok) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        for (uint256 i; i < users.length; ++i) {
+            allowed[users[i]] = ok;
+            emit AllowedSet(users[i], ok);
+        }
+    }
+
+    /// @notice Guardian or admin can pause; only the admin can unpause.
+    function pauseDeposits() external {
+        _checkPauser();
+        depositsPaused = true;
+        emit DepositsPaused(true, msg.sender);
+    }
+
+    function pauseWithdrawals() external {
+        _checkPauser();
+        withdrawalsPaused = true;
+        emit WithdrawalsPaused(true, msg.sender);
+    }
+
+    function unpauseDeposits() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        depositsPaused = false;
+        emit DepositsPaused(false, msg.sender);
+    }
+
+    function unpauseWithdrawals() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        withdrawalsPaused = false;
+        emit WithdrawalsPaused(false, msg.sender);
+    }
+
+    function _checkPauser() private view {
+        if (!hasRole(GUARDIAN_ROLE, msg.sender) && !hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) {
+            revert AccessControlUnauthorizedAccount(msg.sender, GUARDIAN_ROLE);
+        }
+    }
+
+    /// @dev a key may hold SIGNER or COSIGNER, never both (otherwise one stolen key could pass the cosign check)
+    function _grantRole(bytes32 role, address account) internal override returns (bool) {
+        if (role == SIGNER_ROLE && hasRole(COSIGNER_ROLE, account)) revert BadConfig();
+        if (role == COSIGNER_ROLE && hasRole(SIGNER_ROLE, account)) revert BadConfig();
+        return super._grantRole(role, account);
+    }
+}
