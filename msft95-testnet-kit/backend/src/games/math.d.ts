@@ -1,0 +1,10 @@
+export const MATH_SOURCE_SHA256: string;
+export const SLOTS_MATH: { version: string; reels: number; rows: number; strips: number[][]; lines: number[][]; pay: Record<string, number[]>;
+  scatterPay: Record<number, number>; freeSpins: number; fsMult: number; maxWinX: number; buyX: number; WILD: number; SCAT: number; rtp: number };
+export function slotsGrid(stops: number[]): number[][];
+export function slotsEvaluate(stops: number[], totalBet: number, mult: number): { grid: number[][]; steps: any[]; wins: any[]; scatter: { cells: number[][]; win: number }; total: number; trigger: boolean };
+export function slotsRandomStops(rand: () => number): number[];
+export const KENO_MATH: { version: string; numbers: number; draw: number; minPicks: number; maxPicks: number; pays: Record<number, Record<number, number>>;
+  bonusMin: Record<number, number>; freeGames: number; fgMult: number; maxWinX: number; buyX: Record<number, number>; rtp: Record<number, number> };
+export function kenoDraw(rand: () => number): number[];
+export function kenoEvaluate(picks: number[], drawn: number[], bet: number, mult: number): { hits: number[]; catch: number; x: number; win: number; catBall: boolean; bonus: boolean };

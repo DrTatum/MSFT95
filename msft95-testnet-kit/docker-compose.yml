@@ -1,0 +1,25 @@
+# MSFT95 testnet: Postgres + the casino API (+ Caddy for HTTPS when ports 80/443 are free).
+# Started by ./msft95.sh — the values below come from ./.env, which the script writes.
+name: msft95-testnet
+services:
+  db:
+    image: postgres:16
+    environment: { POSTGRES_USER: casino, POSTGRES_PASSWORD: "${DB_PASSWORD}", POSTGRES_DB: casino }
+    volumes: [ "pgdata:/var/lib/postgresql/data" ]
+    restart: unless-stopped
+  api:
+    build: ./backend
+    env_file: ./backend/.env
+    environment: { DATABASE_URL: "postgres://casino:${DB_PASSWORD}@db:5432/casino" }
+    ports: [ "127.0.0.1:${API_PORT:-8795}:8787" ]   # only reachable through the web server on this machine
+    depends_on: [ db ]
+    restart: unless-stopped
+  caddy:
+    image: caddy:2
+    profiles: [ caddy ]
+    environment: { DOMAIN: "${DOMAIN}" }
+    ports: [ "80:80", "443:443" ]
+    volumes: [ "./Caddyfile:/etc/caddy/Caddyfile:ro", "./site:/srv/site:ro", "caddy_data:/data", "caddy_config:/config" ]
+    depends_on: [ api ]
+    restart: unless-stopped
+volumes: { pgdata: {}, caddy_data: {}, caddy_config: {} }

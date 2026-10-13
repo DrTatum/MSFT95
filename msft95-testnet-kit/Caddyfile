@@ -1,0 +1,11 @@
+# The testnet site at the root, the API under /api (Caddy gets the HTTPS certificate by itself)
+{$DOMAIN} {
+	encode gzip
+	handle_path /api/* {
+		reverse_proxy api:8787
+	}
+	handle {
+		root * /srv/site
+		file_server
+	}
+}
